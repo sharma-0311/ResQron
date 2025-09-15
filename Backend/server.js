@@ -1,500 +1,743 @@
-import express from 'express';
-import http from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
-import bodyParser from 'body-parser';
-import mqtt from 'mqtt';
-import mongoose from 'mongoose';
-import dotenv from 'dotenv';
-import Mission from './models/Missions.js';
-import Drone from './models/Drone.js';
-import EventModel from './models/Event.js';
-import NoFlyZone from './models/NoflyZone.js';
-import Disaster from './models/Disaster.js';
-import fetch from 'node-fetch';
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import cors from "cors";
+import bodyParser from "body-parser";
+import mqtt from "mqtt";
+import mongoose from "mongoose";
+import dotenv from "dotenv";
+import fetch from "node-fetch";
+import Mission from "./models/Mission.js";
+import Drone from "./models/Drone.js";
+import EventModel from "./models/Event.js";
+import NoFlyZone from "./models/NolyZone.js";
+import Disaster from "./models/Disaster.js";
+
+import { runAnalytics } from "./Services/aiAnalytics.js";
 
 dotenv.config();
 
+// Config
 const PORT = process.env.PORT || 5000;
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/sih';
-const MQTT_URL = process.env.MQTT_URL || 'mqtt://localhost:1883';
-const BATTERY_FAILSAFE = parseFloat(process.env.BATTERY_FAILSAFE || '20');
-const MIN_BATTERY_ASSIGN = parseFloat(process.env.MIN_BATTERY_ASSIGN || '35');
+const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/sih";
+const MQTT_URL = process.env.MQTT_URL || "mqtt://localhost:1883";
+const BATTERY_FAILSAFE = parseFloat(process.env.BATTERY_FAILSAFE || "20");
+const MIN_BATTERY_ASSIGN = parseFloat(process.env.MIN_BATTERY_ASSIGN || "35");
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || null;
-const PLANNER_URL = process.env.PLANNER_URL || 'http://localhost:8000';
+const PLANNER_URL = process.env.PLANNER_URL || "http://localhost:8000";
 
-await mongoose.connect(MONGO_URI).catch(err => { console.error('Mongo conn err', err); process.exit(1); });
-console.log('MongoDB connected');
+// MongoDB
+await mongoose.connect(MONGO_URI).catch((err) => {
+  console.error("Mongo connection error", err);
+  process.exit(1);
+});
+console.log("MongoDB connected");
 
+// Express + Socket.io
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { cors: { origin: "*" } });
 
 // MQTT client
 const mqttClient = mqtt.connect(MQTT_URL);
-// Command tracking and simple per-drone rate limiting
-const pendingAcks = new Map(); // cmdId -> { resolve, reject, timeout }
-const lastCommandAt = new Map(); // callsign -> timestamp
+const pendingAcks = new Map();
+const lastCommandAt = new Map();
 const MIN_COMMAND_INTERVAL_MS = 200;
-mqttClient.on('connect', () => {
-  console.log('MQTT connected to', MQTT_URL);
-  mqttClient.subscribe('drone/+/telemetry');
-  mqttClient.subscribe('drone/+/event');
-  mqttClient.subscribe('drone/+/ack');
+
+mqttClient.on("connect", () => {
+  console.log("MQTT connected to", MQTT_URL);
+  mqttClient.subscribe("drone/+/telemetry");
+  mqttClient.subscribe("drone/+/event");
+  mqttClient.subscribe("drone/+/ack");
+  
+  // Subscribe to AI perception systems
+  mqttClient.subscribe("perception/+/detections");
+  mqttClient.subscribe("depth/+/estimates");
+  mqttClient.subscribe("obstacles/+/update");
+  
+  console.log("Subscribed to AI perception topics");
 });
 
-mqttClient.on('message', async (topic, message) => {
+mqttClient.on("message", async (topic, message) => {
   try {
     const payload = JSON.parse(message.toString());
+
+    // ---------------- Telemetry ----------------
     if (topic.match(/^drone\/[^\/]+\/telemetry$/)) {
-      const callsign = topic.split('/')[1];
-      // upsert drone
+      const callsign = topic.split("/")[1];
       const update = {
         callsign,
         battery: payload.battery ?? 100,
-        mode: payload.mode ?? 'IDLE',
+        mode: payload.mode ?? "IDLE",
         lastSeen: new Date(),
         location: { lat: payload.lat ?? 0, lng: payload.lng ?? 0, alt: payload.alt ?? 0 },
       };
-      // push to path array (bounded to last 200)
-      const drone = await Drone.findOneAndUpdate({ callsign }, {
-        $set: update,
-        $push: { path: { $each: [ [update.location.lat, update.location.lng] ], $slice: -200 } }
-      }, { upsert: true, new: true });
 
-      // battery failsafe
-      if (drone.battery <= BATTERY_FAILSAFE && drone.mode !== 'RTL') {
-        console.log(`Battery low for ${callsign} (${drone.battery}). Issuing RTL & reassign...`);
-        mqttClient.publish(`drone/${callsign}/command`, JSON.stringify({ cmd: 'rtl' }));
-        await Drone.updateOne({ callsign }, { $set: { mode: 'RTL' } });
-        // reassign any active mission assigned to this drone
-        const active = await Mission.findOne({ assignedTo: callsign, status: 'active' });
+      const drone = await Drone.findOneAndUpdate(
+        { callsign },
+        {
+          $set: update,
+          $push: { path: { $each: [[update.location.lat, update.location.lng]], $slice: -200 } },
+        },
+        { upsert: true, new: true }
+      );
+
+      // Failsafe RTL if battery low
+      if (drone.battery <= BATTERY_FAILSAFE && drone.mode !== "RTL") {
+        console.log(`Battery low for ${callsign} (${drone.battery}%) → RTL`);
+        mqttClient.publish(`drone/${callsign}/command`, JSON.stringify({ cmd: "rtl" }));
+        await Drone.updateOne({ callsign }, { $set: { mode: "RTL" } });
+
+        const active = await Mission.findOne({ assignedTo: callsign, status: "active" });
         if (active) {
           active.assignedTo = null;
-          active.status = 'queued';
+          active.status = "queued";
           await active.save();
           await tryAssignQueuedMissions();
-          io.emit('mission-updated', active);
+          io.emit("mission-updated", active);
         }
       }
 
-      io.emit('drone-update', drone);
+      io.emit("drone-update", drone);
     }
 
+    // ---------------- Events ----------------
     if (topic.match(/^drone\/[^\/]+\/event$/)) {
-      const callsign = topic.split('/')[1];
-      const ev = new EventModel({ type: payload.event || 'unknown', payload, source: callsign });
+      const callsign = topic.split("/")[1];
+      const ev = new EventModel({ type: payload.event || "unknown", payload, source: callsign });
       await ev.save();
-      io.emit('drone-event', { callsign, event: payload });
-      // Human detection -> auto-create rescue mission and assign
-      if ((payload.event === 'human_detected') && payload.location) {
-        try {
-          const m = new Mission({
-            name: 'Rescue - human detected',
-            waypoints: [[payload.location.lat, payload.location.lng]],
-            supplies: ['first_aid','water','blanket'],
-            priority: 1,
-            metadata: { source: 'ai', confidence: payload.confidence, image: payload.image }
-          });
-          await m.save();
-          io.emit('mission-created', m);
-          await tryAssignQueuedMissions();
-        } catch (e) { console.error('rescue mission create err', e); }
+      io.emit("drone-event", { callsign, event: payload });
+
+      // Human detected → auto create rescue mission
+      if (payload.event === "human_detected" && payload.location) {
+        const m = new Mission({
+          name: "Rescue - human detected",
+          waypoints: [[payload.location.lat, payload.location.lng]],
+          supplies: ["first_aid", "water", "blanket"],
+          priority: 1,
+          metadata: { source: "ai", confidence: payload.confidence, image: payload.image },
+        });
+        await m.save();
+        io.emit("mission-created", m);
+        await tryAssignQueuedMissions();
       }
     }
 
-    // Command acknowledgements from bridge
+    // ---------------- ACK ----------------
     if (topic.match(/^drone\/[^\/]+\/ack$/)) {
       const cmdId = payload?.cmdId;
       if (cmdId && pendingAcks.has(cmdId)) {
         const entry = pendingAcks.get(cmdId);
         clearTimeout(entry.timeout);
         pendingAcks.delete(cmdId);
-        entry.resolve({ ok: true, status: payload.status || 'ACK' });
+        entry.resolve({ ok: true, status: payload.status || "ACK" });
       }
     }
+
+    // ---------------- AI Perception Systems ----------------
+    if (topic.match(/^perception\/[^\/]+\/detections$/)) {
+      const cameraId = topic.split("/")[1];
+      await handlePerceptionDetections(cameraId, payload);
+    }
+
+    if (topic.match(/^depth\/[^\/]+\/estimates$/)) {
+      const cameraId = topic.split("/")[1];
+      await handleDepthEstimates(cameraId, payload);
+    }
+
+    if (topic.match(/^obstacles\/[^\/]+\/update$/)) {
+      const sourceId = topic.split("/")[1];
+      await handleObstacleUpdate(sourceId, payload);
+    }
   } catch (e) {
-    console.error('MQTT msg parse error', e);
+    console.error("MQTT msg parse error", e);
   }
 });
 
-// Simple in-memory queue order by priority (lower number = higher priority)
+// ---------------- AI Perception Handlers ----------------
+async function handlePerceptionDetections(cameraId, payload) {
+  try {
+    console.log(`Received detections from camera ${cameraId}:`, payload.detections?.length || 0, "objects");
+    
+    // Store detection data for dashboard
+    const detectionData = {
+      cameraId,
+      timestamp: payload.timestamp || Date.now(),
+      detections: payload.detections || [],
+      processingMs: payload.processing_ms || 0,
+      model: payload.model || "unknown"
+    };
+
+    // Emit to dashboard
+    io.emit("perception-detections", detectionData);
+
+    // Check for critical detections that need immediate response
+    const criticalDetections = payload.detections?.filter(d => 
+      d.class === "person" && d.conf > 0.7
+    ) || [];
+
+    if (criticalDetections.length > 0) {
+      console.log(`Critical detection: ${criticalDetections.length} person(s) detected by camera ${cameraId}`);
+      
+      // Create emergency rescue missions
+      for (const detection of criticalDetections) {
+        const mission = new Mission({
+          name: `Emergency Rescue - Person detected by ${cameraId}`,
+          waypoints: [[detection.lat || 34.0, detection.lng || -118.0]], // Simplified coordinates
+          supplies: ["first_aid", "water", "blanket", "emergency_kit"],
+          priority: 1,
+          metadata: { 
+            source: "ai_perception", 
+            cameraId,
+            confidence: detection.conf,
+            detectionId: detection.id || "unknown",
+            bbox: [detection.xmin, detection.ymin, detection.xmax, detection.ymax]
+          },
+        });
+        await mission.save();
+        io.emit("mission-created", mission);
+        await tryAssignQueuedMissions();
+      }
+    }
+
+    // Forward to planner for obstacle updates
+    if (PLANNER_URL) {
+      try {
+        const plannerPayload = {
+          camera_id: cameraId,
+          detections: payload.detections,
+          timestamp: payload.timestamp
+        };
+        
+        // Publish to planner for obstacle mapping
+        mqttClient.publish(`perception/${cameraId}/detections`, JSON.stringify(plannerPayload));
+      } catch (e) {
+        console.error("Failed to forward detections to planner:", e);
+      }
+    }
+
+  } catch (e) {
+    console.error("Error handling perception detections:", e);
+  }
+}
+
+async function handleDepthEstimates(cameraId, payload) {
+  try {
+    console.log(`Received depth estimates from camera ${cameraId}:`, payload.depth_estimates?.length || 0, "objects");
+    
+    // Store depth data for dashboard
+    const depthData = {
+      cameraId,
+      timestamp: payload.timestamp || Date.now(),
+      depthEstimates: payload.depth_estimates || [],
+      depthMapPath: payload.depth_map_path,
+      processingMs: payload.processing_ms || 0,
+      detectionCount: payload.detection_count || 0
+    };
+
+    // Emit to dashboard
+    io.emit("depth-estimates", depthData);
+
+    // Analyze depth data for obstacle proximity warnings
+    const closeObstacles = payload.depth_estimates?.filter(d => 
+      d.average_depth < 30 && d.depth_confidence === "high"
+    ) || [];
+
+    if (closeObstacles.length > 0) {
+      console.log(`Close obstacles detected by camera ${cameraId}:`, closeObstacles.length);
+      
+      // Emit proximity warning
+      io.emit("proximity-warning", {
+        cameraId,
+        closeObstacles: closeObstacles.length,
+        timestamp: Date.now()
+      });
+    }
+
+  } catch (e) {
+    console.error("Error handling depth estimates:", e);
+  }
+}
+
+async function handleObstacleUpdate(sourceId, payload) {
+  try {
+    console.log(`Received obstacle update from ${sourceId}:`, payload.obstacles?.length || 0, "obstacles");
+    
+    // Store obstacle data
+    const obstacleData = {
+      sourceId,
+      timestamp: payload.timestamp || Date.now(),
+      obstacles: payload.obstacles || [],
+      obstacleCount: payload.obstacle_count || 0
+    };
+
+    // Emit to dashboard
+    io.emit("obstacle-update", obstacleData);
+
+    // Check if any active missions need replanning due to new obstacles
+    const activeMissions = await Mission.find({ status: "active" });
+    for (const mission of activeMissions) {
+      // Simple check - in a real system, you'd do more sophisticated collision detection
+      const needsReplanning = payload.obstacles?.some(obstacle => {
+        // Check if obstacle is near mission path (simplified)
+        return Math.abs(obstacle.lat - mission.waypoints[0][0]) < 0.001 && 
+               Math.abs(obstacle.lon - mission.waypoints[0][1]) < 0.001;
+      });
+
+      if (needsReplanning) {
+        console.log(`Mission ${mission._id} needs replanning due to new obstacles`);
+        io.emit("mission-replan-needed", { missionId: mission._id, reason: "new_obstacles" });
+      }
+    }
+
+  } catch (e) {
+    console.error("Error handling obstacle update:", e);
+  }
+}
+
+// ---------------- Mission Assignment Logic ----------------
 async function tryAssignQueuedMissions() {
-  // find highest priority queued mission
-  const m = await Mission.findOne({ status: 'queued' }).sort({ priority: 1, createdAt: 1 }).exec();
+  const m = await Mission.findOne({ status: "queued" }).sort({ priority: 1, createdAt: 1 }).exec();
   if (!m) return;
-  // choose best drone
   const drone = await chooseBestAvailableDrone();
   if (!drone) return;
-  // assign
+
   m.assignedTo = drone.callsign;
-  m.status = 'active';
+  m.status = "active";
   await m.save();
-  // publish to mqtt
+
   mqttClient.publish(`mission/${m._id}/assign`, JSON.stringify(m));
-  io.emit('mission-updated', m);
-  console.log('Assigned mission', m._id, 'to', drone.callsign);
-  // try assign next one (recursive)
+  io.emit("mission-updated", m);
+  console.log("Assigned mission", m._id, "to", drone.callsign);
+
   setImmediate(tryAssignQueuedMissions);
 }
 
 async function chooseBestAvailableDrone() {
-  // available drones: battery >= MIN_BATTERY_ASSIGN, mode !== RTL and not currently assigned active mission
-  const drones = await Drone.find({ battery: { $gte: MIN_BATTERY_ASSIGN }, mode: { $ne: 'RTL' } }).exec();
-  if (!drones || drones.length === 0) return null;
-  // exclude drones that are currently assigned active mission
-  const busy = await Mission.find({ status: 'active' }).distinct('assignedTo').exec();
-  const candidates = drones.filter(d => !busy.includes(d.callsign));
+  const drones = await Drone.find({ battery: { $gte: MIN_BATTERY_ASSIGN }, mode: { $ne: "RTL" } }).exec();
+  const busy = await Mission.find({ status: "active" }).distinct("assignedTo").exec();
+  const candidates = drones.filter((d) => !busy.includes(d.callsign));
   if (!candidates.length) return null;
-  // pick highest battery
-  candidates.sort((a,b) => b.battery - a.battery);
+  candidates.sort((a, b) => b.battery - a.battery);
   return candidates[0];
 }
 
-// REST APIs
+// ---------------- REST APIs ----------------
+app.get("/api/drones", async (req, res) => res.json(await Drone.find().exec()));
+app.get("/api/missions", async (req, res) => res.json(await Mission.find().sort({ createdAt: -1 }).limit(200).exec()));
 
-// Create mission
-app.post('/api/missions', async (req, res) => {
-  const { name, waypoints, supplies = [], priority = 5, metadata = {} } = req.body;
-  if (!waypoints || !Array.isArray(waypoints) || waypoints.length === 0) return res.status(400).json({ ok:false, msg:'waypoints required' });
-  const m = new Mission({ name, waypoints, supplies, priority, metadata });
-  await m.save();
-  await tryAssignQueuedMissions();
-  io.emit('mission-created', m);
-  return res.json({ ok:true, mission: m });
+// POST endpoint for creating missions (used by demo feeds)
+app.post("/missions", async (req, res) => {
+  try {
+    const missionData = req.body;
+    
+    // Create new mission
+    const mission = new Mission({
+      name: missionData.name || 'Unnamed Mission',
+      waypoints: missionData.waypoints || [],
+      supplies: missionData.supplies || [],
+      priority: missionData.priority || 5,
+      assignedTo: missionData.assignedTo || null,
+      status: missionData.status || 'queued',
+      metadata: missionData.metadata || {}
+    });
+    
+    const savedMission = await mission.save();
+    
+    // Emit to dashboard via Socket.io
+    io.emit('mission_created', savedMission);
+    
+    // Publish to MQTT
+    mqttClient.publish('missions/new', JSON.stringify(savedMission));
+    
+    console.log(`New mission created: ${savedMission._id} - ${savedMission.name}`);
+    
+    res.status(201).json(savedMission);
+  } catch (error) {
+    console.error('Error creating mission:', error);
+    res.status(500).json({ error: 'Failed to create mission' });
+  }
 });
 
-// Force assign
-app.post('/api/missions/:id/assign', async (req, res) => {
-  const id = req.params.id;
-  const { callsign } = req.body;
-  const mission = await Mission.findById(id).exec();
-  if (!mission) return res.status(404).json({ ok:false, msg:'mission not found' });
-  mission.assignedTo = callsign;
-  mission.status = 'active';
-  await mission.save();
-  mqttClient.publish(`mission/${mission._id}/assign`, JSON.stringify(mission));
-  io.emit('mission-updated', mission);
-  return res.json({ ok:true, mission });
+app.get("/api/disasters", async (req, res) => res.json(await Disaster.find().sort({ detectedAt: -1 }).limit(100).exec()));
+
+// POST endpoint for creating disasters (used by demo feeds)
+app.post("/disasters", async (req, res) => {
+  try {
+    const disasterData = req.body;
+    
+    // Create new disaster
+    const disaster = new Disaster({
+      type: disasterData.type || 'unknown',
+      severity: disasterData.severity || 'moderate',
+      confidence: disasterData.confidence || 0.5,
+      coordinates: disasterData.coordinates || { lat: 0, lng: 0 },
+      description: disasterData.description || '',
+      recommendedActions: disasterData.recommendedActions || [],
+      status: disasterData.status || 'detected',
+      assignedDrones: disasterData.assignedDrones || [],
+      imageUrl: disasterData.imageUrl || '',
+      detectedAt: disasterData.detectedAt ? new Date(disasterData.detectedAt) : new Date(),
+      metadata: disasterData.metadata || {}
+    });
+    
+    const savedDisaster = await disaster.save();
+    
+    // Emit to dashboard via Socket.io
+    io.emit('disaster_detected', savedDisaster);
+    
+    // Publish to MQTT
+    mqttClient.publish('disasters/new', JSON.stringify(savedDisaster));
+    
+    console.log(`New disaster created: ${savedDisaster._id} - ${savedDisaster.type}`);
+    
+    res.status(201).json(savedDisaster);
+  } catch (error) {
+    console.error('Error creating disaster:', error);
+    res.status(500).json({ error: 'Failed to create disaster' });
+  }
 });
 
-// list missions
-app.get('/api/missions', async (req,res) => {
-  const ms = await Mission.find().sort({ createdAt: -1 }).limit(200).exec();
-  res.json(ms);
+app.get("/api/events", async (req, res) => res.json(await EventModel.find().sort({ createdAt: -1 }).limit(200).exec()));
+
+// ---------------- AI Integration APIs ----------------
+app.get("/api/perception/status", async (req, res) => {
+  try {
+    // Get recent detection data
+    const recentDetections = await EventModel.find({ 
+      type: "perception_detection" 
+    }).sort({ createdAt: -1 }).limit(50).exec();
+    
+    res.json({
+      status: "operational",
+      recentDetections: recentDetections.length,
+      lastUpdate: recentDetections[0]?.createdAt || null,
+      mqttConnected: mqttClient.connected
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// list drones
-app.get('/api/drones', async (req,res) => {
-  const ds = await Drone.find().exec();
-  res.json(ds);
+app.post("/api/perception/request", async (req, res) => {
+  try {
+    const { cameraId, imageData, requestType = "detection" } = req.body;
+    
+    if (!cameraId || !imageData) {
+      return res.status(400).json({ error: "cameraId and imageData are required" });
+    }
+
+    // Forward request to AI services via MQTT
+    const requestPayload = {
+      camera_id: cameraId,
+      image_data: imageData,
+      request_type: requestType,
+      timestamp: Date.now()
+    };
+
+    mqttClient.publish(`ai/${cameraId}/request`, JSON.stringify(requestPayload));
+    
+    res.json({ 
+      message: "Request sent to AI services",
+      cameraId,
+      requestType 
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// drone direct command (rest)
-app.post('/api/drone/:callsign/command', async (req,res) => {
+app.get("/api/obstacles", async (req, res) => {
+  try {
+    // Get obstacle data from planner service
+    if (PLANNER_URL) {
+      const response = await fetch(`${PLANNER_URL}/obstacles`);
+      const obstacleData = await response.json();
+      res.json(obstacleData);
+    } else {
+      res.json({ 
+        obstacle_count: 0, 
+        obstacles: [],
+        message: "Planner service not configured" 
+      });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/geofences", async (req, res) => {
+  try {
+    // Get geofence data from planner service
+    if (PLANNER_URL) {
+      const response = await fetch(`${PLANNER_URL}/geofences`);
+      const geofenceData = await response.json();
+      res.json(geofenceData);
+    } else {
+      res.json({ 
+        geofence_count: 0, 
+        geofences: [],
+        message: "Planner service not configured" 
+      });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/plan/mission", async (req, res) => {
+  try {
+    const { droneId, start, goal, useDynamicObstacles = true } = req.body;
+    
+    if (!droneId || !start || !goal) {
+      return res.status(400).json({ error: "droneId, start, and goal are required" });
+    }
+
+    // Forward to planner service
+    if (PLANNER_URL) {
+      const plannerResponse = await fetch(`${PLANNER_URL}/plan_direct`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          start,
+          goal,
+          use_dynamic_obstacles: useDynamicObstacles
+        })
+      });
+      
+      const pathData = await plannerResponse.json();
+      res.json(pathData);
+    } else {
+      res.status(503).json({ error: "Planner service not available" });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/system/health", async (req, res) => {
+  try {
+    const healthData = {
+      backend: {
+        status: "healthy",
+        mqttConnected: mqttClient.connected,
+        websocketClients: io.engine.clientsCount,
+        uptime: process.uptime()
+      },
+      ai: {
+        perceptionService: AI_SERVICE_URL ? "configured" : "not_configured",
+        plannerService: PLANNER_URL ? "configured" : "not_configured"
+      },
+      database: {
+        status: "connected",
+        droneCount: await Drone.countDocuments(),
+        missionCount: await Mission.countDocuments(),
+        eventCount: await EventModel.countDocuments()
+      },
+      timestamp: Date.now()
+    };
+
+    res.json(healthData);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Drone commands (Takeoff, Land, RTL, etc.)
+app.post("/api/drone/:callsign/command", async (req, res) => {
   try {
     const { callsign } = req.params;
     const { cmd, meta } = req.body;
-    // rate limit per drone
     const now = Date.now();
     const last = lastCommandAt.get(callsign) || 0;
-    if (now - last < MIN_COMMAND_INTERVAL_MS) {
-      return res.status(429).json({ ok:false, msg:'rate_limited' });
-    }
-    lastCommandAt.set(callsign, now);
+    if (now - last < MIN_COMMAND_INTERVAL_MS) return res.status(429).json({ ok: false, msg: "rate_limited" });
 
-    const cmdId = `${callsign}_${now}_${Math.floor(Math.random()*1e6)}`;
+    lastCommandAt.set(callsign, now);
+    const cmdId = `${callsign}_${now}_${Math.floor(Math.random() * 1e6)}`;
     const payload = { cmdId, cmd, meta };
+
     const awaitAck = new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         pendingAcks.delete(cmdId);
-        reject(new Error('ack_timeout'));
+        reject(new Error("ack_timeout"));
       }, 3000);
       pendingAcks.set(cmdId, { resolve, reject, timeout });
     });
+
     mqttClient.publish(`drone/${callsign}/command`, JSON.stringify(payload));
     await awaitAck;
-    return res.json({ ok:true, cmdId });
+    res.json({ ok: true, cmdId });
   } catch (e) {
-    return res.status(500).json({ ok:false, err:e.toString() });
+    res.status(500).json({ ok: false, err: e.toString() });
   }
 });
 
-// analyze image -> calls AI microservice (if present)
-app.post('/api/analyze-image', async (req,res) => {
-  const { imageUrl, coordinates } = req.body;
-  try {
-    if (!AI_SERVICE_URL) return res.json({ ok:true, result: { label:'unknown', confidence:0.5 } });
-    const r = await fetch(`${AI_SERVICE_URL}/analyze-url`, { 
-      method: 'POST', 
-      body: JSON.stringify({ imageUrl, coordinates }), 
-      headers: { 'Content-Type':'application/json' } 
-    });
-    const json = await r.json();
-    return res.json({ ok:true, result: json });
-  } catch (e) {
-    return res.status(500).json({ ok:false, err: e.toString() });
-  }
-});
+// ---------------- WebSocket ----------------
+io.on("connection", async (socket) => {
+  console.log("Frontend connected", socket.id);
 
-// Enhanced disaster detection endpoint
-app.post('/api/detect-disaster', async (req, res) => {
-  const { imageUrl, coordinates, droneCallsign } = req.body;
+  // Send initial system state
   try {
-    if (!AI_SERVICE_URL) {
-      return res.status(503).json({ ok: false, msg: 'AI service not available' });
-    }
-    
-    const response = await fetch(`${AI_SERVICE_URL}/analyze-url`, {
-      method: 'POST',
-      body: JSON.stringify({ imageUrl, coordinates }),
-      headers: { 'Content-Type': 'application/json' }
+    socket.emit("system-status", {
+      drones: await Drone.find().exec(),
+      missions: await Mission.find().sort({ createdAt: -1 }).limit(50).exec(),
+      timestamp: Date.now()
     });
-    
-    if (!response.ok) {
-      throw new Error(`AI service error: ${response.status}`);
-    }
-    
-    const detection = await response.json();
-    
-    // Create disaster record
-    const disaster = new Disaster({
-      type: detection.label,
-      severity: detection.severity,
-      confidence: detection.confidence,
-      coordinates: {
-        lat: detection.coordinates[0],
-        lng: detection.coordinates[1]
-      },
-      description: detection.description,
-      recommendedActions: detection.recommended_actions,
-      imageUrl: imageUrl,
-      assignedDrones: droneCallsign ? [droneCallsign] : []
+  } catch (error) {
+    console.error("Error sending initial system state:", error);
+    socket.emit("system-status", {
+      drones: [],
+      missions: [],
+      timestamp: Date.now()
     });
-    
-    await disaster.save();
-    
-    // Emit real-time update
-    io.emit('disaster-detected', disaster);
-    
-    // Auto-assign nearby drone if available
-    if (!droneCallsign) {
-      const nearbyDrone = await findNearestAvailableDrone(disaster.coordinates.lat, disaster.coordinates.lng);
-      if (nearbyDrone) {
-        disaster.assignedDrones.push(nearbyDrone.callsign);
-        await disaster.save();
-        
-        // Create emergency mission
-        const emergencyMission = new Mission({
-          name: `Emergency Response - ${disaster.type}`,
-          waypoints: [[disaster.coordinates.lat, disaster.coordinates.lng]],
-          supplies: getEmergencySupplies(disaster.type),
-          priority: 1, // Highest priority
-          assignedTo: nearbyDrone.callsign,
-          status: 'active',
-          metadata: { disasterId: disaster._id, type: 'emergency' }
+  }
+
+  socket.on("command", ({ droneId, cmd }) => {
+    if (!droneId || !cmd) return;
+    mqttClient.publish(`drone/${droneId}/command`, JSON.stringify({ cmd }));
+    console.log("MQTT command", droneId, cmd);
+  });
+
+  socket.on("return-home", (droneId) => {
+    mqttClient.publish(`drone/${droneId}/command`, JSON.stringify({ cmd: "rtl" }));
+  });
+
+  socket.on("enable-autonomous", (droneId) => {
+    mqttClient.publish(`drone/${droneId}/command`, JSON.stringify({ cmd: "autonomous_on" }));
+  });
+
+  socket.on("disable-autonomous", (droneId) => {
+    mqttClient.publish(`drone/${droneId}/command`, JSON.stringify({ cmd: "autonomous_off" }));
+  });
+
+  socket.on("assign-zone", ({ droneId, zoneId, priority }) => {
+    mqttClient.publish(`drone/${droneId}/command`, JSON.stringify({ cmd: "assign_zone", zone: zoneId, priority }));
+  });
+
+  // AI-related WebSocket events
+  socket.on("request-perception", async ({ cameraId, imageData }) => {
+    try {
+      const requestPayload = {
+        camera_id: cameraId,
+        image_data: imageData,
+        request_type: "detection",
+        timestamp: Date.now()
+      };
+      
+      mqttClient.publish(`ai/${cameraId}/request`, JSON.stringify(requestPayload));
+      socket.emit("perception-request-sent", { cameraId, timestamp: Date.now() });
+    } catch (e) {
+      socket.emit("error", { message: "Failed to send perception request", error: e.message });
+    }
+  });
+
+  socket.on("request-depth", async ({ cameraId, imageData, detections }) => {
+    try {
+      const requestPayload = {
+        camera_id: cameraId,
+        image_data: imageData,
+        detections: detections || [],
+        request_type: "depth",
+        timestamp: Date.now()
+      };
+      
+      mqttClient.publish(`depth/${cameraId}/request`, JSON.stringify(requestPayload));
+      socket.emit("depth-request-sent", { cameraId, timestamp: Date.now() });
+    } catch (e) {
+      socket.emit("error", { message: "Failed to send depth request", error: e.message });
+    }
+  });
+
+  socket.on("plan-mission", async ({ droneId, start, goal, useDynamicObstacles = true }) => {
+    try {
+      if (!droneId || !start || !goal) {
+        socket.emit("error", { message: "droneId, start, and goal are required" });
+        return;
+      }
+
+      if (PLANNER_URL) {
+        const response = await fetch(`${PLANNER_URL}/plan_direct`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            start,
+            goal,
+            use_dynamic_obstacles: useDynamicObstacles
+          })
         });
         
-        await emergencyMission.save();
-        io.emit('mission-created', emergencyMission);
+        const pathData = await response.json();
+        socket.emit("mission-planned", { droneId, path: pathData });
+      } else {
+        socket.emit("error", { message: "Planner service not available" });
       }
+    } catch (e) {
+      socket.emit("error", { message: "Failed to plan mission", error: e.message });
     }
-    
-    return res.json({ ok: true, disaster });
-  } catch (e) {
-    console.error('Disaster detection error:', e);
-    return res.status(500).json({ ok: false, err: e.toString() });
-  }
-});
+  });
 
-// Proxy text classification to AI service
-app.post('/api/classify-text', async (req, res) => {
-  try {
-    if (!AI_SERVICE_URL) return res.status(503).json({ ok:false, msg:'AI service not available' });
-    const r = await fetch(`${AI_SERVICE_URL}/classify-text`, {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json' },
-      body: JSON.stringify(req.body)
-    });
-    const json = await r.json();
-    return res.json({ ok:true, result: json });
-  } catch (e) {
-    return res.status(500).json({ ok:false, err: e.toString() });
-  }
-});
-
-// Proxy object detection to AI service (file upload)
-app.post('/api/detect-objects', async (req, res) => {
-  try {
-    if (!AI_SERVICE_URL) return res.status(503).json({ ok:false, msg:'AI service not available' });
-    // For brevity, expect frontend to send URL and backend refetches or use form-data in future
-    return res.status(501).json({ ok:false, msg:'Use /api/analyze-image or AI /detect-objects with multipart form-data' });
-  } catch (e) {
-    return res.status(500).json({ ok:false, err: e.toString() });
-  }
-});
-
-// Get all disasters
-app.get('/api/disasters', async (req, res) => {
-  const disasters = await Disaster.find().sort({ detectedAt: -1 }).limit(100).exec();
-  res.json(disasters);
-});
-
-// Update disaster status
-app.put('/api/disasters/:id/status', async (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
-  
-  const disaster = await Disaster.findById(id);
-  if (!disaster) return res.status(404).json({ ok: false, msg: 'Disaster not found' });
-  
-  disaster.status = status;
-  if (status === 'resolved') {
-    disaster.resolvedAt = new Date();
-  }
-  
-  await disaster.save();
-  io.emit('disaster-updated', disaster);
-  
-  return res.json({ ok: true, disaster });
-});
-
-// Proxy to planner service
-app.post('/api/plan', async (req, res) => {
-  try {
-    const r = await fetch(`${PLANNER_URL}/plan`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
-    });
-    const json = await r.json();
-    if (!r.ok) return res.status(400).json({ ok:false, err: json.detail || 'plan failed' });
-    return res.json({ ok:true, result: json });
-  } catch (e) {
-    return res.status(500).json({ ok:false, err: e.toString() });
-  }
-});
-
-// Reactive obstacle avoidance
-app.post('/api/avoid', async (req, res) => {
-  try {
-    const r = await fetch(`${PLANNER_URL}/avoid`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
-    });
-    const json = await r.json();
-    if (!r.ok) return res.status(400).json({ ok:false, err: json.detail || 'avoid failed' });
-    // If sidestep recommended, publish a micro-adjust command to drone
-    const { callsign, new_heading, command } = { callsign:req.body.callsign, ...json };
-    if (command === 'sidestep' && callsign) {
-      mqttClient.publish(`drone/${callsign}/command`, JSON.stringify({ cmd:'adjust_heading', meta:{ heading:new_heading } }));
+  socket.on("update-obstacles", async ({ obstacles }) => {
+    try {
+      if (PLANNER_URL) {
+        const response = await fetch(`${PLANNER_URL}/update_obstacles`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(obstacles)
+        });
+        
+        const result = await response.json();
+        socket.emit("obstacles-updated", result);
+      } else {
+        socket.emit("error", { message: "Planner service not available" });
+      }
+    } catch (e) {
+      socket.emit("error", { message: "Failed to update obstacles", error: e.message });
     }
-    return res.json({ ok:true, result: json });
-  } catch (e) {
-    return res.status(500).json({ ok:false, err: e.toString() });
-  }
-});
+  });
 
-// Helper functions
-async function findNearestAvailableDrone(lat, lng) {
-  const drones = await Drone.find({ 
-    battery: { $gte: MIN_BATTERY_ASSIGN }, 
-    mode: { $ne: 'RTL' } 
-  }).exec();
-  
-  if (!drones.length) return null;
-  
-  // Simple distance calculation (in production, use proper geospatial queries)
-  let nearest = null;
-  let minDistance = Infinity;
-  
-  for (const drone of drones) {
-    const distance = Math.sqrt(
-      Math.pow(drone.location.lat - lat, 2) + Math.pow(drone.location.lng - lng, 2)
-    );
-    if (distance < minDistance) {
-      minDistance = distance;
-      nearest = drone;
+  socket.on("get-system-status", async () => {
+    try {
+      const healthData = {
+        backend: {
+          status: "healthy",
+          mqttConnected: mqttClient.connected,
+          websocketClients: io.engine.clientsCount,
+          uptime: process.uptime()
+        },
+        ai: {
+          perceptionService: AI_SERVICE_URL ? "configured" : "not_configured",
+          plannerService: PLANNER_URL ? "configured" : "not_configured"
+        },
+        database: {
+          status: "connected",
+          droneCount: await Drone.countDocuments(),
+          missionCount: await Mission.countDocuments(),
+          eventCount: await EventModel.countDocuments()
+        },
+        timestamp: Date.now()
+      };
+      
+      socket.emit("system-status", healthData);
+    } catch (e) {
+      socket.emit("error", { message: "Failed to get system status", error: e.message });
     }
+  });
+
+  socket.on("disconnect", () => console.log("Frontend disconnected", socket.id));
+});
+
+// ---------------- Analytics Loop ----------------
+setInterval(async () => {
+  try {
+    const analytics = await runAnalytics();
+    io.emit("system-health", analytics);
+  } catch (e) {
+    console.error("Analytics error", e);
   }
-  
-  return nearest;
-}
+}, 10000); // every 10s
 
-function getEmergencySupplies(disasterType) {
-  const supplies = {
-    'flood': ['life_vests', 'rescue_ropes', 'first_aid', 'water_purification'],
-    'fire': ['fire_extinguishers', 'fire_blankets', 'first_aid', 'oxygen_masks'],
-    'earthquake': ['search_rescue_equipment', 'first_aid', 'emergency_blankets', 'water'],
-    'landslide': ['shovels', 'first_aid', 'emergency_blankets', 'rescue_ropes'],
-    'other': ['first_aid', 'emergency_blankets', 'water', 'communication_equipment']
-  };
-  
-  return supplies[disasterType] || supplies['other'];
-}
-
-// add nofly zone
-app.post('/api/nofly', async (req,res) => {
-  const { name, polygon } = req.body;
-  if (!polygon || !Array.isArray(polygon)) return res.status(400).json({ ok:false, msg:'polygon required' });
-  const nf = new NoFlyZone({ name, polygon });
-  await nf.save();
-  res.json({ ok:true, zone: nf });
-});
-
-// get events
-app.get('/api/events', async (req,res) => {
-  const ev = await EventModel.find().sort({ createdAt: -1 }).limit(200).exec();
-  res.json(ev);
-});
-
-// websocket actions
-io.on('connection', (socket) => {
-  console.log('WS connected', socket.id);
-
-  socket.on('create-mission', async (payload) => {
-    // payload: { name, waypoints, supplies, priority }
-    const m = new Mission(payload);
-    await m.save();
-    await tryAssignQueuedMissions();
-    io.emit('mission-created', m);
-  });
-
-  // Emergency and autonomy controls mapped to MQTT bridge
-  socket.on('return-home', (callsign) => {
-    if (!callsign) return;
-    const cmdId = `${callsign}_${Date.now()}_${Math.floor(Math.random()*1e6)}`;
-    mqttClient.publish(`drone/${callsign}/command`, JSON.stringify({ cmdId, cmd: 'rtl' }));
-  });
-
-  socket.on('enable-autonomous', (callsign) => {
-    if (!callsign) return;
-    const cmdId = `${callsign}_${Date.now()}_${Math.floor(Math.random()*1e6)}`;
-    mqttClient.publish(`drone/${callsign}/command`, JSON.stringify({ cmdId, cmd: 'set_mode', meta: { mode: 'AUTO' } }));
-  });
-
-  socket.on('disable-autonomous', (callsign) => {
-    if (!callsign) return;
-    const cmdId = `${callsign}_${Date.now()}_${Math.floor(Math.random()*1e6)}`;
-    mqttClient.publish(`drone/${callsign}/command`, JSON.stringify({ cmdId, cmd: 'set_mode', meta: { mode: 'LOITER' } }));
-  });
-
-  socket.on('assign-zone', ({ droneId, zoneId, priority }) => {
-    if (!droneId || !zoneId) return;
-    mqttClient.publish(`drone/${droneId}/command`, JSON.stringify({ cmd: 'assign_zone', meta: { zoneId, priority } }));
-  });
-
-  socket.on('create-zone', (zone) => {
-    mqttClient.publish('zones/create', JSON.stringify(zone));
-    io.emit('zone-created', zone);
-  });
-
-  socket.on('disconnect', ()=> console.log('WS disconnect', socket.id));
-});
-
-// Start server and also trigger queue worker
+// ---------------- Start ----------------
 server.listen(PORT, () => console.log(`Backend listening on ${PORT}`));
-setInterval(tryAssignQueuedMissions, 5000); // safety - periodically try to assign
+setInterval(tryAssignQueuedMissions, 5000);

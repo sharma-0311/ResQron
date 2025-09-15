@@ -1,11 +1,9 @@
-# ai/service.py
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from pydantic import BaseModel
 import uvicorn, random, base64, io, os
 from PIL import Image
 import numpy as np
 
-# Optional heavyweight deps (transformers / onnxruntime). Fallbacks used if unavailable
 _has_transformers = False
 _has_onnx = False
 try:
@@ -98,9 +96,6 @@ async def detect_objects(file: UploadFile = File(...)):
         img_bytes = await file.read()
         # Try ONNX runtime path if available, else stub
         if _has_onnx:
-            # Placeholder: in real use, load session with env var path
-            # session = ort.InferenceSession(os.getenv('DETECT_ONNX_PATH', 'yolov8n.onnx'))
-            # preprocess -> session.run -> postprocess
             pass
         # Simple stub: return no boxes
         return DetectObjectsResponse(boxes=[])

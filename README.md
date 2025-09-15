@@ -44,12 +44,19 @@ We combine **predictive AI models**, **autonomous drones**, and a **real-time co
 
 ResQron/
 ├── backend/ # Core backend APIs & logic for disaster prediction and drone coordination
+|
 ├── dashboard/ # React-based control & monitoring dashboard for real-time insights
+|
 ├── sim/ # AI simulation models & inference modules (floods, cyclones, etc.)
+|
 ├── docs/ # Documentation, architecture details, and usage guides
+|
 ├── integration_setup.py # Script to configure external APIs and third-party service integrations
+|
 ├── start_services.bat # Quick-start script to launch all services on Windows
+|
 ├── package.json # Frontend (dashboard) dependencies & scripts
+|
 └── package-lock.json # Dependency lock file for consistent builds
 
 ---
@@ -101,7 +108,7 @@ Open: 👉 http://localhost:<PORT>
 ---
 
 ## Documentation
-###Explore the docs/folder for:
+### Explore the docs/folder for:
 
 - System Architecture
 - API Endpoints
@@ -112,15 +119,18 @@ Open: 👉 http://localhost:<PORT>
 
 ## Achievements
  
-🏅 ###Winners – HackBhoomi 2025 (Invertis University Internal Hackathon)
-✨ ###Recognized for AI Innovation in Disaster Response
+🏅 ### Winners – HackBhoomi 2025 (Invertis University Internal Hackathon)
+
+✨ ### Recognized for AI Innovation in Disaster Response
 
 ---
 
 ## Contact
 
 📌 *Team ResQron*
+
 📧 Email: rgour6350@gmail.com
+
 🌐 GitHub: @sharma-0311
 
 ## Final Note

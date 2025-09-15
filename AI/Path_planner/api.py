@@ -1,73 +1,70 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Tuple
-import heapq, math
-
-app = FastAPI()
-
-class PlanRequest(BaseModel):
-    start: List[float]
-    goal: List[float]   
-    blocked: List[List[float]] = []  # list of [lat,lng] blocked cells
-    deny: List[List[List[float]]] = []  # polygons
-
-class PlanResponse(BaseModel):
-    path: List[List[float]]
+import argparse, os
+import pandas as pd
+from datasets import Dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
 
 
-def astar(start: Tuple[float,float], goal: Tuple[float,float], blocked: set):
-    def h(a,b):
-        return abs(a[0]-b[0]) + abs(a[1]-b[1])
-    openq = []
-    heapq.heappush(openq, (0, start))
-    came = {start: None}
-    g = {start: 0}
-    while openq:
-        _, cur = heapq.heappop(openq)
-        if cur == goal:
-            path = []
-            while cur is not None:
-                path.append(list(cur))
-                cur = came[cur]
-            return list(reversed(path))
-        for dx,dy in [(1,0),(-1,0),(0,1),(0,-1)]:
-            nb = (round(cur[0]+dx*1e-3,6), round(cur[1]+dy*1e-3,6))
-            if nb in blocked:
-                continue
-            ng = g[cur] + 1
-            if nb not in g or ng < g[nb]:
-                g[nb] = ng
-                came[nb] = cur
-                f = ng + h(nb, goal)
-                heapq.heappush(openq, (f, nb))
-    return []
+def load_data(csv_path: str):
+    df = pd.read_csv(csv_path)
+    if 'text' not in df.columns or 'label' not in df.columns:
+        raise ValueError("CSV must contain 'text' and 'label' columns")
+    return Dataset.from_pandas(df[['text','label']])
 
-@app.post('/plan', response_model=PlanResponse)
-async def plan(req: PlanRequest):
-    start = (round(req.start[0],6), round(req.start[1],6))
-    goal = (round(req.goal[0],6), round(req.goal[1],6))
-    blocked = set((round(b[0],6), round(b[1],6)) for b in req.blocked)
-    path = astar(start, goal, blocked)
-    if not path:
-        raise HTTPException(status_code=400, detail='no path')
-    return PlanResponse(path=path)
 
-class AvoidRequest(BaseModel):
-    position: List[float]
-    obstacle: List[float]  # [lat,lng]
-    heading: float = 0.0
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', required=True)
+    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--batch', type=int, default=16)
+    parser.add_argument('--model', default='distilbert-base-uncased')
+    parser.add_argument('--output', required=True)
+    args = parser.parse_args()
 
-class AvoidResponse(BaseModel):
-    new_heading: float
-    command: str
+    ds = load_data(args.data)
+    label_names = sorted(list(set(ds['label'])))
+    label2id = {l:i for i,l in enumerate(label_names)}
+    id2label = {i:l for l,i in label2id.items()}
+    ds = ds.map(lambda x: {'labels': label2id[x['label']]} )
 
-@app.post('/avoid', response_model=AvoidResponse)
-async def avoid(req: AvoidRequest):
-    # Simple reactive avoid: sidestep 10 degrees if obstacle is within ~5m grid
-    # Placeholder: replace with potential fields or VFH
-    cmd = 'hold'
-    new_hdg = req.heading
-    if abs(req.position[0]-req.obstacle[0]) < 5e-4 and abs(req.position[1]-req.obstacle[1]) < 5e-4:
-        cmd = 'sidestep'
-        new_hdg = (req.heading + 10.0) % 360.0
-    return AvoidResponse(new_heading=new_hdg, command=cmd)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    def tok(batch):
+        return tokenizer(batch['text'], truncation=True, padding='max_length', max_length=128)
+    ds = ds.map(tok, batched=True)
+    ds = ds.rename_column('labels','labels')
+    ds.set_format(type='torch', columns=['input_ids','attention_mask','labels'])
+
+    split = ds.train_test_split(test_size=0.1, seed=42)
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model, num_labels=len(label_names), id2label=id2label, label2id=label2id
+    )
+
+    training_args = TrainingArguments(
+        output_dir=args.output,
+        per_device_train_batch_size=args.batch,
+        per_device_eval_batch_size=args.batch,
+        num_train_epochs=args.epochs,
+        evaluation_strategy='epoch',
+        save_strategy='epoch',
+        logging_steps=50,
+        load_best_model_at_end=True,
+        metric_for_best_model='eval_loss'
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=split['train'],
+        eval_dataset=split['test']
+    )
+
+    trainer.train()
+    os.makedirs(args.output, exist_ok=True)
+    trainer.save_model(args.output)
+    tokenizer.save_pretrained(args.output)
+    with open(os.path.join(args.output,'labels.txt'),'w') as f:
+        for l in label_names:
+            f.write(str(l)+'\n')
+
+if __name__ == '__main__':
+    main()

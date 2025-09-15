@@ -4,7 +4,6 @@
   <img src="https://img.shields.io/badge/Innovation-Disaster%20Tech-red?style=for-the-badge"/>
   <img src="https://img.shields.io/badge/AI-Powered-blue?style=for-the-badge"/>
   <img src="https://img.shields.io/badge/Drone-Autonomous-green?style=for-the-badge"/>
-  <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge"/>
 </p>
 
 ---
@@ -29,7 +28,7 @@ We combine **predictive AI models**, **autonomous drones**, and a **real-time co
 
 ---
 
-## 🖼 Demo Preview
+##  Demo Preview
 
 <p align="center">
   <img src="https://via.placeholder.com/800x400.png?text=ResQron+Dashboard+Preview" alt="ResQron Dashboard"/>

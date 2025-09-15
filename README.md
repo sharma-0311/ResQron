@@ -31,11 +31,7 @@ We combine **predictive AI models**, **autonomous drones**, and a **real-time co
 ##  Demo Preview
 
 <p align="center">
-  <img src="https://via.placeholder.com/800x400.png?text=ResQron+Dashboard+Preview" alt="ResQron Dashboard"/>
-</p>
-
-<p align="center">
-  <em>(Replace with actual screenshots or GIFs of your dashboard, drone missions, or prediction results.)</em>
+  <img src="file:///C:/Users/rgour/OneDrive/Pictures/Screenshots/ResQron_DashBoard.png" alt="ResQron Dashboard"/>
 </p>
 
 ---
@@ -139,4 +135,4 @@ Open: 👉 http://localhost:<PORT>
 ResQron isn’t just a project… it’s a mission.
 To make disaster response smarter, faster, and life-saving.
 
-<p align="center"> 🚁🌊🌪️🔥 <br/> <em>"Because in disasters, technology should save lives — not just data."</em> </p> ```
+🚁🌊🌪️🔥 "Because in disasters, technology should save lives — not just data. ```

@@ -19,12 +19,31 @@ We combine **predictive AI models**, **autonomous drones**, and a **real-time co
 
 ##  Core Highlights
 
+ResQron is an **AI-powered disaster response system** that integrates:
 - **AI Prediction Models** – Forecast floods, cyclones, earthquakes, and landslides.  
 - **Autonomous Drones** – Carry & deliver rescue kits (4–6 kg payload).  
 - **Interactive Dashboard** – Real-time monitoring, alerts, and mission control.  
 - **Offline AI Inference** – Powered by **TensorFlow Lite Micro** on ESP32 & edge devices.  
 - **Modular & Scalable** – Add new sensors, simulations, or response modules easily.  
 - **End-to-End Workflow** – From **prediction → response → analysis**.
+
+---
+
+## Problem
+When natural disasters strike, **every second counts**.  
+Current rescue operations often face:
+- Delays in disaster detection.
+- Slow supply chain for relief kits.
+- Risk to human rescuers entering dangerous zones.
+
+---
+
+## Our Solution
+ResQron combines **AI + autonomous drones** to:
+1. **Predict disasters** from satellite/sensor data.
+2. **Plan missions automatically** using decision engine.
+3. **Deploy drones** to deliver supplies within minutes.
+4. **Visualize operations** on a central dashboard.
 
 ---
 
@@ -59,11 +78,14 @@ ResQron/
 
 ##  Quick Start
 
-### 1️. Clone the Repository
+### 1. Run with Docker (Recommended)
 ```bash
 git clone https://github.com/sharma-0311/ResQron.git
 cd ResQron
+cp backend/.env.example backend/.env   # configure environment
+docker-compose up --build
 ```
+
 ### 2. Backend Setup
 ```bash
 cd backend
@@ -113,6 +135,21 @@ Open: 👉 http://localhost:<PORT>
 
 ---
 
+## Model & Evaluation
+
+Trained models (place inside backend/models/):
+- model_flood_v1.pt
+- model_cyclone_v1.h5
+- model_landslide_v1.tflite
+
+Sample Metrics:
+Task|F1 Score|Inference (ms)
+Flood|0.86|120
+Cyclone|0.82|140
+Landslide|0.80|115
+
+---
+
 ## Achievements
  
 🏅 ### Winners – HackBhoomi 2025 (Invertis University Internal Hackathon)
@@ -122,8 +159,7 @@ Open: 👉 http://localhost:<PORT>
 ---
 
 ## Contact
-
-📌 *Team ResQron*
+ *Team ResQron*
 
 📧 Email: rgour6350@gmail.com
 

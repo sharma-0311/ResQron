@@ -118,10 +118,10 @@ Open: 👉 http://localhost:<PORT>
 ---
 
 ## Use Case
-- Disaster Simulation – Predict Disasters (River overflows & shelter demands).
-- Evacuation Planning – Optimize rescue routes during road blockages.
-- Post-Disaster Analysis – Replay real data & analyze response efficiency.
-- Drone Deployment – Real-time aid delivery in inaccessible regions.
+- **Disaster Simulation** – Predict Disasters (River overflows & shelter demands).
+- **Evacuation Planning** – Optimize rescue routes during road blockages.
+- **Post-Disaster Analysis** – Replay real data & analyze response efficiency.
+- **Drone Deployment** – Real-time aid delivery in inaccessible regions.
 
 ---
 
@@ -152,9 +152,9 @@ Landslide|0.80|115
 
 ## Achievements
  
-🏅 ### Winners – HackBhoomi 2025 (Invertis University Internal Hackathon)
+🏅 **Winners** – HackBhoomi 2025 (Invertis University Internal Hackathon)
 
-✨ ### Recognized for AI Innovation in Disaster Response
+✨ **Recognized for AI Innovation in Disaster Response**
 
 ---
 

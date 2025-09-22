@@ -1,4 +1,4 @@
-#🌍 ResQron – Autonomous Disaster Detection & Response System
+# ResQron – Autonomous Disaster Detection & Response System
 
 <p align="center">
   <img src="https://img.shields.io/badge/Innovation-Disaster%20Tech-red?style=for-the-badge"/>
@@ -144,9 +144,11 @@ Trained models (place inside backend/models/):
 
 Sample Metrics:
 Task|F1 Score|Inference (ms)
-Flood|0.86|120
-Cyclone|0.82|140
-Landslide|0.80|115
+| Task | Samples | Metric (F1) | Inference Latency (ms) |
+|---------|---------:|------------:|-----------------------:|
+| Flood | 5k | 0.86 | 120 |
+| Cyclone | 3k | 0.82 | 140 |
+| LandSlide | 3k | 0.82 | 140 |
 
 ---
 

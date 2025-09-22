@@ -31,7 +31,7 @@ We combine **predictive AI models**, **autonomous drones**, and a **real-time co
 ##  Demo Preview
 
 <p align="center">
-  <img src="file:///C:/Users/rgour/OneDrive/Pictures/Screenshots/ResQron_DashBoard.png" alt="ResQron Dashboard"/>
+  <img src="./docs/dashboard.png" alt="ResQron Dashboard" width="600"/>
 </p>
 
 ---
